@@ -1,11 +1,25 @@
-#include "Config.h"
-#include "VideoDecoder.h"
-#include "NDIReceiver.h"
-#include "DRMDisplay.h"
 #include "AlsaAudio.h"
+#include "AutoResolutionPolicy.h"
+#include "Config.h"
+#include "DRMDisplay.h"
+#include "DelayedFrameQueue.h"
 #include "IPCServer.h"
+#include "NDIReceiver.h"
+#include "NDIVideoLayout.h"
+#include "NdiSdkConfig.h"
 #include "PlatformDetect.h"
+#include "Telemetry.h"
+#include "VideoDecoder.h"
+#include "audio/AlsaSink.h"
+#include "audio/AlsaSource.h"
+#include "audio/AudioEngine.h"
+#include "audio/AudioMasterLog.h"
+#include "audio/AudioSettings.h"
+#include "audio/HdmiPcm.h"
+#include "audio/NdiAudioSource.h"
+#include "audio/UnavailableAudio.h"
 
+#include <set>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -43,11 +57,6 @@
 #endif
 
 static std::atomic<bool> g_running{true};
-// True when ndi-config.v1.json still carries codec passthrough after the SDK
-// rewrites it during init. If false, HX (H.264/H.265) sources may be decoded
-// internally by the SDK (or fail), so hardware decode won't engage.
-static std::atomic<bool> g_passthrough_ok{false};
-
 static int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -75,54 +84,14 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
-// Map the user's transport selection (Rxpm) to ndi-config.v1.json recv keys.
-// The SDK negotiates transport from these enables; RUDP is the default in NDI 5+.
-// Returns a JSON fragment for the "rudp"/"multicast" objects (no trailing comma).
-//   RUDP            → rudp recv on,  multicast recv off
-//   Multicast       → rudp recv on,  multicast recv on  (sender must also multicast)
-//   TCP / M-TCP     → rudp recv off, multicast recv off (forces TCP)
-//   UDP             → rudp recv off, multicast recv off (plain unicast UDP)
-static std::string transport_json(const std::string& rxpm) {
-    bool rudp = (rxpm == "RUDP" || rxpm == "Multicast" || rxpm.empty());
-    bool mcast = (rxpm == "Multicast");
-    std::string r = rudp ? "true" : "false";
-    std::string m = mcast ? "true" : "false";
-    return std::string("    \"rudp\": { \"recv\": { \"enable\": ") + r + " } },\n"
-         + "    \"multicast\": { \"recv\": { \"enable\": " + m + " } },\n";
-}
-
-static std::string ndimon_ndi_home() {
-    if (access("/var/lib/ndimon", W_OK) == 0)
-        return "/var/lib/ndimon";
-    const char* home = getenv("HOME");
-    if (home && home[0]) return home;
-    return "/root";
-}
-
-// Pin HOME so NDIlib_initialize() and our writer use the same ~/.ndi.
-// Finder runs as user ndimon (HOME=/var/lib/ndimon); decoder is root but
-// must share that directory or discovery/transport/DS settings desync.
 static void pin_ndi_home() {
-    std::string h = ndimon_ndi_home();
-    setenv("HOME", h.c_str(), 1);
+    ndisdk::pin_config_dir("decoder");
 }
 
-static void relax_ndi_config_perms(const std::string& dir, const std::string& file) {
-    chmod(dir.c_str(), 0770);
-    chmod(file.c_str(), 0664);
-    struct passwd* pw = getpwnam("ndimon");
-    struct group*  gr = getgrnam("ndimon");
-    uid_t uid = pw ? pw->pw_uid : static_cast<uid_t>(-1);
-    gid_t gid = gr ? gr->gr_gid : static_cast<gid_t>(-1);
-    if (gid != static_cast<gid_t>(-1)) {
-        chown(dir.c_str(), uid, gid);
-        chown(file.c_str(), uid, gid);
-    }
-}
-
+// pin_ndi_home() must already have run (once, at the top of main, before any
+// thread exists): setenv() here would race with SDK threads calling getenv().
 static void write_ndi_sdk_config(const Config& cfg) {
-    pin_ndi_home();
-    std::string ndi_dir = ndimon_ndi_home() + "/.ndi";
+    std::string ndi_dir = ndisdk::config_dir();
     mkdir(ndi_dir.c_str(), 0770);
     std::string path = ndi_dir + "/ndi-config.v1.json";
 
@@ -135,10 +104,6 @@ static void write_ndi_sdk_config(const Config& cfg) {
     }
 
     // Build JSON manually to avoid pulling nlohmann into this helper.
-    // codec.h264/h265.passthrough=true forces the NDI SDK to deliver HX streams
-    // as compressed H.264/H.265 bitstream rather than decoding them internally.
-    // This is critical on Noble where libavcodec.so.61 (FFmpeg 7) is not available;
-    // without passthrough the SDK renders a "Video Decoder not Found" error frame.
     std::string json =
         "{\n"
         "  \"ndi\": {\n"
@@ -150,19 +115,19 @@ static void write_ndi_sdk_config(const Config& cfg) {
         "      \"ips\": \"" + ips + "\",\n"
         "      \"discovery\": \"" + discovery + "\"\n"
         "    },\n"
-        + transport_json(cfg.transport.rxpm) +
-        "    \"codec\": {\n"
-        "      \"h264\": { \"passthrough\": true },\n"
-        "      \"h265\": { \"passthrough\": true }\n"
-        "    }\n"
+        + ndisdk::config_tail_json(cfg.transport.rxpm) +
         "  }\n"
         "}\n";
 
-    std::ofstream f(path);
-    if (f) {
-        f << json;
-        f.close();
-        relax_ndi_config_perms(ndi_dir, path);
+    // Every apply_config calls this; only a change is written and logged.
+    if (ndisdk::file_has_content(path, json)) return;
+    if (ndisdk::write_file_atomic(path, json)) {
+        if (ndi_dir == "/var/lib/ndimon/.ndi") {
+            // The emergency legacy fallback is still shared by the two users.
+            if (auto* group = getgrnam("ndimon"))
+                chown(path.c_str(), static_cast<uid_t>(-1), group->gr_gid);
+            chmod(path.c_str(), 0664);
+        } else chmod(path.c_str(), 0600);
         std::cout << "[NDIMon-R] NDI config written (transport="
                   << cfg.transport.rxpm << "): " << path << "\n";
     } else {
@@ -170,35 +135,10 @@ static void write_ndi_sdk_config(const Config& cfg) {
     }
 }
 
-// Read back ndi-config.v1.json and confirm h264/h265 passthrough survived the
-// SDK's init-time rewrite. Sets g_passthrough_ok and logs a clear warning.
-static void verify_passthrough_config() {
-    pin_ndi_home();
-    std::string path = ndimon_ndi_home() + "/.ndi/ndi-config.v1.json";
-    std::ifstream f(path);
-    if (!f) { g_passthrough_ok = false; return; }
-    std::string content((std::istreambuf_iterator<char>(f)),
-                         std::istreambuf_iterator<char>());
-    // Cheap structural check: both codecs must mention passthrough true.
-    auto has_pt = [&](const char* codec) {
-        size_t k = content.find(codec);
-        if (k == std::string::npos) return false;
-        size_t pt = content.find("passthrough", k);
-        if (pt == std::string::npos) return false;
-        size_t t = content.find("true", pt);
-        return t != std::string::npos && t < content.find('}', pt);
-    };
-    g_passthrough_ok = has_pt("h264") && has_pt("h265");
-    if (g_passthrough_ok) {
-        std::cout << "[NDIMon-R] HX passthrough config verified (hardware decode path active)\n";
-    } else {
-        std::cerr << "[NDIMon-R] WARNING: HX passthrough NOT present in ndi-config.v1.json "
-                     "after init — H.264/H.265 sources may not hardware-decode.\n";
-    }
-}
-
-// Returns the first non-loopback IPv4 address, or empty string.
+// The splash must advertise the web interface's selected management address.
 static std::string get_primary_ip() {
+    const auto management = ndisdk::network_selection("/etc/ndimon-network-interfaces.json", "management");
+    if (management.managed) return management.address;
     struct ifaddrs* ifa = nullptr;
     getifaddrs(&ifa);
     std::string result;
@@ -283,29 +223,68 @@ public:
         : connector_name_(connector_name)
         , device_(device)
         , preferred_mode_(preferred_mode)
-        , auto_resolution_(preferred_mode.empty() || preferred_mode == "auto")
+        , resolution_policy_(preferred_mode.empty() || preferred_mode == "auto")
         , scale_mode_(scale)
         , has_audio_(has_audio)
         , ch_num_(ch_num)
         , lease_fd_(lease_fd)
     {}
 
+    void set_audio_engine(ndimon::audio::AudioEngine* engine) { engine_ = engine; }
+    void update_audio_capture() {
+        if (!recv_)
+            return;
+        const bool legacy_enabled = Config::instance().decoder.ndi_audio == "NDIAudioEn";
+        recv_->set_audio_enabled(engine_ ? engine_->needs_ndi_audio(ch_num_) &&
+                                               (engine_->uses_output_graph() || legacy_enabled)
+                                         : audio_ && legacy_enabled);
+    }
+    const std::string& connector_name() const { return connector_name_; }
+    int pull_audio(int frames,int channels,float* const* planes,int* captured_channels) { return recv_ ? recv_->pull_audio(frames,channels,planes,captured_channels) : 0; }
+    int video_delay_cap_ms() {
+        std::lock_guard<std::mutex> lock(frame_mtx_);
+        return frame_queue_.max_delay_ms();
+    }
+    int effective_video_delay_ms() {
+        std::lock_guard<std::mutex> lock(frame_mtx_);
+        return frame_queue_.effective_delay_ms();
+    }
+    void set_video_delay(int ms) {
+        std::lock_guard<std::mutex> lock(frame_mtx_);
+        frame_queue_.set_delay_ms(engine_ && has_audio_ ? ms : 0);
+        frame_cv_.notify_one();
+    }
     void set_ipc(IPCServer* ipc) { ipc_ = ipc; }
 
-    // Replay the last buffered routing event to all subscribers (startup race safety)
-    void replay_routing_event() {
+    // Replay a Discovery Server route the control plane may have missed (it
+    // was restarting) while this output is still on that source.
+    void replay_remote_source() {
         if (!ipc_) return;
-        std::lock_guard<std::mutex> lk(routing_event_mutex_);
-        if (!last_routing_event_.is_null()) {
-            ipc_->push_event(last_routing_event_);
+        nlohmann::json ev;
+        {
+            std::lock_guard<std::mutex> lk(source_mutex_);
+            if (!remote_origin_) return;
+            ev = remote_source_event(source_name_);
         }
+        ipc_->push_event(ev);
     }
 
-    // Push current connection state to newly connected subscriber so Node.js
-    // can start a retry loop immediately if the saved source is unavailable.
-    // drm_ready is included so Node.js won't start a reconnect loop for an
+    nlohmann::json remote_source_event(const std::string& name) const {
+        return {{"type", "remote_source"}, {"output", ch_num_ - 1}, {"source", name}};
+    }
+
+    // The control plane already holds this source because the Discovery
+    // Server put the receiver on it: connecting again would only interrupt it.
+    bool on_remote_source(const std::string& name, const std::string& ip) const {
+        std::lock_guard<std::mutex> lk(source_mutex_);
+        return remote_origin_ && ip.empty() && name == source_name_;
+    }
+
+    // Push current connection state to newly connected subscriber so the control
+    // supervisor can start a retry loop immediately if the saved source is unavailable.
+    // drm_ready is included so the supervisor won't start a reconnect loop for an
     // output with no physical display (avoids fighting with workers that have
-    // no display but have a saved source from a previous DS routing event).
+    // no display but have a saved source from a previous Discovery Server route).
     void push_connection_state() {
         if (!ipc_) return;
         nlohmann::json ev;
@@ -335,9 +314,7 @@ public:
             // Don't destroy drm_ — check_hotplug() needs the fd
         } else {
             // Apply persisted rotation before first splash
-            auto out_cfg = Config::instance().get_output(ch_num_);
-            if (out_cfg.rotation != 0)
-                drm_->set_rotation(out_cfg.rotation);
+            apply_saved_rotation();
             drm_->show_splash(false);
             std::cout << "[Worker" << ch_num_ << "] DRM ready: "
                       << drm_->width() << "x" << drm_->height()
@@ -359,7 +336,7 @@ public:
         }
 
         // Create audio (only one worker gets audio)
-        if (has_audio_ && !audio_in_use_.exchange(true)) {
+        if (!engine_ && has_audio_ && !audio_in_use_.exchange(true)) {
             auto audio = std::make_unique<AlsaAudio>();
             std::string hdmi_dev = AlsaAudio::find_hdmi_device(connector_name_);
             if (audio->init(hdmi_dev, 48000, 2)) {
@@ -373,66 +350,36 @@ public:
 
         // Create NDI receiver
         recv_ = std::make_unique<NDIReceiver>();
+        recv_->set_audio_pull_mode(engine_ != nullptr);
+        update_audio_capture();
 
         recv_->set_video_callback([this](NDIVideoFrame& vf) {
             on_video(vf);
         });
+        if (DropTelemetry::enabled()) {
+            telemetry_ = std::make_unique<DropTelemetry>(ch_num_);
+            recv_->set_pull_callback([this](int64_t ts) { telemetry_->on_pull(ts); });
+        }
         recv_->set_audio_callback([this](NDIAudioFrame& af) {
             on_audio(af);
         });
         recv_->set_connection_callback([this](bool connected, const std::string& src) {
             on_connection(connected, src);
         });
-        recv_->set_status_metadata_callback([this]() -> std::string {
-            // Build device telemetry XML for Discovery Server
-            int w = input_w_.load(), h = input_h_.load();
-            std::string res = std::to_string(w) + "x" + std::to_string(h);
-
-            // Read SoC temperature
-            int soc_temp = 0;
+        recv_->set_remote_source_callback([this](const std::string& name) {
+            // The SDK already switched the receiver on a Discovery Server
+            // command. Record it and tell the control plane, which saves it as
+            // this output's source; it must never be answered with a connect.
             {
-                std::ifstream tf("/sys/class/thermal/thermal_zone0/temp");
-                if (tf) { tf >> soc_temp; soc_temp /= 1000; }
+                std::lock_guard<std::mutex> lk(source_mutex_);
+                source_name_ = name;
+                source_ip_.clear();
+                remote_origin_ = !name.empty();
+                if (!name.empty()) last_source_ = name;
             }
-
-            // Build XML
-            char buf[512];
-            snprintf(buf, sizeof(buf),
-                "<ndi_device_status"
-                " fps=\"%.2f\""
-                " resolution=\"%s\""
-                " codec=\"%s\""
-                " stream_type=\"%s\""
-                " connected=\"%s\""
-                " health=\"%s\""
-                " soc_temp_c=\"%d\""
-                " stall_count=\"%d\""
-                "/>",
-                fps_.load(),
-                res.c_str(),
-                codec_name_.c_str(),
-                (recv_ && recv_->stream_type() == NDIStreamType::HX) ? "HX" :
-                (recv_ && recv_->stream_type() == NDIStreamType::Standard) ? "Standard" : "unknown",
-                connected_.load() ? "true" : "false",
-                health_state().c_str(),
-                soc_temp,
-                stall_count_);
-            return std::string(buf);
-        });
-        recv_->set_routing_callback([this](const std::string& name, const std::string& url) {
-            // Discovery server assigned a new source — push event to Node.js,
-            // which owns all routing decisions. Buffer for subscriber reconnect replay.
-            if (!ipc_) return;
-            nlohmann::json ev;
-            ev["type"]   = "routing";
-            ev["source"] = name;
-            ev["url"]    = url;
-            ev["output"] = ch_num_ - 1;
-            {
-                std::lock_guard<std::mutex> lk(routing_event_mutex_);
-                last_routing_event_ = ev;
-            }
-            ipc_->push_event(ev);
+            std::cout << "[Worker" << ch_num_ << "] Discovery Server "
+                      << (name.empty() ? "disconnected the output" : "routed to: " + name) << "\n";
+            if (ipc_) ipc_->push_event(remote_source_event(name));
         });
 
         // Auto-connect to last source
@@ -455,6 +402,8 @@ public:
             !cfg.finder.discovery_server_ip.empty()) {
             recv_->set_discovery_server(cfg.finder.discovery_server_ip);
         }
+        recv_->set_advertising(cfg.finder.receiver_advertising, cfg.finder.remote_control,
+                               build_recv_name());
 
         // Always create and register the NDI receiver so this device appears
         // as a receiver in the DS regardless of display state.
@@ -482,19 +431,13 @@ public:
     }
 
     void stop() {
+        if (engine_)
+            engine_->unregister_ndi(ch_num_); // revoke and acknowledge this receiver's pulls
         // Stop display thread first so it doesn't race with drm_ teardown
         display_running_ = false;
         frame_cv_.notify_all();
         if (display_thr_.joinable()) display_thr_.join();
-        {
-            std::lock_guard<std::mutex> lk(frame_mtx_);
-            while (!frame_queue_.empty()) {
-                auto& rf = frame_queue_.front();
-                if (rf.owns_ndi_frame && recv_)
-                    recv_->free_video(&rf.ndi_frame);
-                frame_queue_.pop();
-            }
-        }
+        drain_queued_frames();
 
         if (recv_) {
             recv_->disconnect();
@@ -533,13 +476,14 @@ public:
         connected_ = false;
         {
             std::lock_guard<std::mutex> lk(source_mutex_);
+            // A retry of the routed source keeps its origin; anything else is local.
+            remote_origin_ = remote_origin_ && real_source && name == source_name_;
             source_name_ = name;
             source_ip_   = ip;
         }
 
-        // Build properties metadata to send to the source/DS on connection.
-        // Informs the DS of the device identity, current routing assignment,
-        // and audio/video/general configuration.
+        // Build properties metadata to send to the source on connection:
+        // device identity and audio/video/general configuration.
         if (recv_ && real_source) {
             auto& cfg = Config::instance();
             auto out  = cfg.get_output(ch_num_);
@@ -557,11 +501,6 @@ public:
                 " model=\"NDI Decoder\""
                 " session=\"" + alias + "\""
                 " serial=\"" + cfg.device.ndi_recv_name + "\"/>";
-
-            // Routing ack — tells the DS which source this receiver is showing
-            xml += "<ndi_routing>"
-                   "<source name=\"" + name + "\" url=\"" + ip + "\"/>"
-                   "</ndi_routing>";
 
             // Audio
             xml += std::string("<ndi_audio_setup")
@@ -610,6 +549,10 @@ public:
         oc.source_name = real_source ? name : "";
         oc.source_ip   = real_source ? ip   : "";
         cfg.set_output(ch_num_, oc);
+
+        // connect() has stopped the recv thread, so no new callback is in
+        // on_video. Drop frames from the previous source.
+        drain_queued_frames();
     }
 
     void disconnect_source() {
@@ -627,16 +570,9 @@ public:
             ev["drm_ready"] = drm_ready();
             ipc_->push_event(ev);
         }
-        // Drain any queued frames so display_loop doesn't re-set streaming_
-        {
-            std::lock_guard<std::mutex> lk(frame_mtx_);
-            while (!frame_queue_.empty()) {
-                auto& rf = frame_queue_.front();
-                if (rf.owns_ndi_frame && recv_)
-                    recv_->free_video(&rf.ndi_frame);
-                frame_queue_.pop();
-            }
-        }
+        // Drop both queues so a stale HX frame cannot put the old picture
+        // back up after splash. Saved source and the connection event stay.
+        drain_queued_frames();
         if (drm_) drm_->set_streaming(false);
         // Schedule splash render on main-loop tick() instead of blocking the
         // IPC thread — at 4K the software fill can take hundreds of ms.
@@ -653,6 +589,7 @@ public:
             std::lock_guard<std::mutex> lk(source_mutex_);
             source_name_.clear();
             source_ip_.clear();
+            remote_origin_ = false;
         }
         auto& cfg = Config::instance();
         OutputConfig oc = cfg.get_output(ch_num_);
@@ -666,7 +603,7 @@ public:
     }
 
     void set_audio_enabled(bool en) {
-        if (recv_) recv_->set_audio_enabled(en);
+        if (recv_) recv_->set_audio_enabled(en && (audio_ != nullptr || engine_ != nullptr));
     }
 
     void set_discovery_server(const std::string& ip) {
@@ -676,6 +613,11 @@ public:
     void reload_config() {
         auto& cfg = Config::instance();
         auto out_cfg = cfg.get_output(ch_num_);
+        {
+            std::string error;
+            auto audio = cfg.audio_settings(&error);
+            if (error.empty()) set_video_delay(audio.video_delay_ms);
+        }
 
         // Update scale mode
         ScaleMode sm = ScaleMode::Letterbox;
@@ -687,8 +629,7 @@ public:
         }
 
         // Rotation
-        if (drm_ && out_cfg.rotation != drm_->rotation())
-            drm_->set_rotation(out_cfg.rotation);
+        apply_saved_rotation();
 
         // OSD
         if (drm_) {
@@ -706,20 +647,29 @@ public:
                 write_ndi_sdk_config(cfg);   // update ndi-config.v1.json
                 recv_->reload_discovery(ds); // recreate advertiser with new DS
             }
+            recv_->set_advertising(cfg.finder.receiver_advertising, cfg.finder.remote_control,
+                                   build_recv_name());
         }
 
-        // Transport mode — the SDK only reads transport settings from
-        // ndi-config.v1.json at recv creation, so a change requires rewriting
-        // the config and recreating the recv instance.
+        // Transport mode — the SDK reads transport settings from
+        // ndi-config.v1.json when it starts, not when a receiver is created
+        // (measured on the RK3588: recreating the receiver kept the old
+        // transport). Apply a change by leaving cleanly; systemd restarts the
+        // decoder (Restart=always) and it reconnects to the saved source.
         if (recv_ && cfg.transport.rxpm != recv_->get_transport()) {
+            std::cout << "[Worker" << ch_num_ << "] transport '" << recv_->get_transport()
+                      << "' -> '" << cfg.transport.rxpm << "' — restarting to apply\n";
             write_ndi_sdk_config(cfg);
-            recv_->reload_transport(cfg.transport.rxpm);
+            g_running = false;
         }
 
-        // Audio enable/disable (ch1 legacy)
-        if (ch_num_ == 1) {
-            recv_->set_audio_enabled(cfg.decoder.ndi_audio == "NDIAudioEn");
-        }
+        // Legacy tally is global, including receivers on outputs other than ch1.
+        // Apply both on and off to an already connected source.
+        if (recv_ && connected_.load())
+            recv_->set_tally(cfg.decoder.tally_mode == "TallyOn", false);
+
+        // One output owns ALSA; the legacy setting controls that owner.
+        update_audio_capture();
 
         // Decode mode (auto/hardware/software) — recreate the decoder so the
         // factory re-selects the backend. The next compressed frame re-inits it.
@@ -727,7 +677,17 @@ public:
             std::cout << "[Worker" << ch_num_ << "] decode_mode '" << decode_mode_
                       << "' -> '" << cfg.device.decode_mode << "' — rebuilding decoder\n";
             decode_mode_ = cfg.device.decode_mode;
-            std::lock_guard<std::mutex> lk(decoder_mutex_);
+            std::queue<DecodedFrame> pending;
+            std::lock_guard<std::mutex> dk(decoder_mutex_);
+            {
+                std::lock_guard<std::mutex> fk(frame_mtx_);
+                pending.swap(hx_queue_);
+            }
+            while (!pending.empty()) {
+                DecodedFrame old = std::move(pending.front());
+                pending.pop();
+                if (decoder_) decoder_->release_frame(old);
+            }
             if (decoder_) { decoder_->flush(); decoder_->destroy(); decoder_.reset(); }
             decoder_ = VideoDecoder::create();
             if (decoder_) {
@@ -767,37 +727,37 @@ public:
         return drm_ && drm_->is_streaming();
     }
 
-    bool set_resolution(uint32_t w, uint32_t h, double refresh_hz) {
-        if (!drm_ || !drm_->is_initialized()) return false;
-        bool ok = drm_->set_mode(w, h, refresh_hz);
-        if (ok) {
+    ResolutionResult set_resolution(uint32_t w, uint32_t h, double refresh_hz, int64_t deadline_monotonic_ms) {
+        if (!drm_ || !drm_->is_initialized()) return ResolutionResult::Failed;
+        return resolution_policy_.set_manual(
+            [&] { return drm_->set_mode(w, h, refresh_hz, deadline_monotonic_ms); }, [&] {
             // Manual resolution change — disable auto mode and persist
-            auto_resolution_ = false;
             auto& cfg = Config::instance();
             OutputConfig oc = cfg.get_output(ch_num_);
             oc.preferred_mode = std::to_string(w) + "x" + std::to_string(h);
             cfg.set_output(ch_num_, oc);
             std::cout << "[Worker" << ch_num_ << "] Resolution set (manual): "
                       << w << "x" << h << "@" << refresh_hz << "\n";
-        }
-        return ok;
+        }, deadline_monotonic_ms);
     }
 
     // Reset to auto mode — output will match source resolution/framerate
-    void set_auto_resolution() {
-        auto_resolution_ = true;
-        auto& cfg = Config::instance();
-        OutputConfig oc = cfg.get_output(ch_num_);
-        oc.preferred_mode = "";
-        cfg.set_output(ch_num_, oc);
-        std::cout << "[Worker" << ch_num_ << "] Resolution set to auto\n";
+    ResolutionResult set_auto_resolution(int64_t deadline_monotonic_ms) {
+        return resolution_policy_.enable_auto([&] {
+            auto& cfg = Config::instance();
+            OutputConfig oc = cfg.get_output(ch_num_);
+            oc.preferred_mode = "";
+            cfg.set_output(ch_num_, oc);
+            std::cout << "[Worker" << ch_num_ << "] Resolution set to auto\n";
+        }, deadline_monotonic_ms);
     }
 
     nlohmann::json get_modes() const {
         nlohmann::json j;
         j["modes"] = nlohmann::json::array();
-        j["auto_resolution"] = auto_resolution_;
+        j["auto_resolution"] = resolution_policy_.enabled();
         j["rotation"] = drm_ ? drm_->rotation() : 0;
+        j["supported_rotations"] = drm_ ? drm_->supported_rotations() : std::vector<uint32_t>{0};
         j["current"]["width"]      = drm_ ? drm_->width()      : 0;
         j["current"]["height"]     = drm_ ? drm_->height()     : 0;
         j["current"]["refresh"]    = drm_ ? drm_->refresh()    : 0;
@@ -828,6 +788,26 @@ public:
         cfg.set_output(ch_num_, oc);
     }
 
+    bool rotation_busy() const { return drm_ && drm_->rotation_busy(); }
+
+    void apply_saved_rotation() {
+        if (!drm_ || !drm_->is_initialized()) return;
+        auto& cfg = Config::instance();
+        auto output = cfg.get_output(ch_num_);
+        if (output.rotation == drm_->rotation()) return;
+        if (!drm_->rotation_allowed(output.rotation)) {
+            std::cerr << "[Worker" << ch_num_ << "] Saved rotation " << output.rotation
+                      << " unsupported; retaining " << drm_->rotation() << " degrees\n";
+            output.rotation = drm_->rotation();
+            cfg.set_output(ch_num_, output);
+        } else if (!drm_->set_rotation(output.rotation)) {
+            // A transient format/TEST_ONLY/busy failure must not erase a valid
+            // saved preference. Only the renderer policy normalizes settings.
+            std::cerr << "[Worker" << ch_num_ << "] Saved rotation " << output.rotation
+                      << " not applied yet; keeping the saved preference\n";
+        }
+    }
+
     bool set_rotation(uint32_t degrees) {
         if (!drm_) return false;
         if (!drm_->set_rotation(degrees)) return false;
@@ -837,6 +817,8 @@ public:
         cfg.set_output(ch_num_, oc);
         return true;
     }
+
+    bool compressed_frame_observed() const { return hx_stream_.load(); }
 
     nlohmann::json get_status() const {
         nlohmann::json s;
@@ -852,10 +834,15 @@ public:
         s["recv_name"]    = recv_ ? recv_->get_recv_name() : build_recv_name();
         s["device_name"]  = Config::instance().device.ndi_recv_name;
         s["drm_ready"]    = drm_ready();
+        s["compressed_frame_observed"] = compressed_frame_observed();
         s["connected"]    = connected_.load();
+        s["audio_enabled"] = recv_ && recv_->audio_enabled();
+        s["audio_available"] = audio_ != nullptr || engine_ != nullptr;
+        s["audio_underruns"] = audio_ ? audio_->underruns() : 0;
         {
             std::lock_guard<std::mutex> lk(source_mutex_);
             s["source_name"] = source_name_;
+            s["source_origin"] = remote_origin_ ? "discovery_server" : "local";
         }
         s["input_width"]  = input_w_.load();
         s["input_height"] = input_h_.load();
@@ -872,9 +859,16 @@ public:
         s["refresh_hz"]   = drm_ ? drm_->refresh_hz() : 0.0;
         {
             std::lock_guard<std::mutex> lk(decoder_mutex_);
-            s["codec"]    = codec_name_;
-            s["decode_backend"] = decoder_ ? decoder_->backend_name() : "none";
-            s["hw_decode"]      = decoder_ ? decoder_->is_hardware()  : false;
+            bool receiving = connected_.load() && last_video_frame_ms_.load() > 0 && codec_name_ != "none";
+            s["codec"] = receiving ? codec_name_ : "none";
+            if (receiving && codec_name_ == "uncompressed") {
+                s["decode_backend"] = "ndi-sdk";
+                s["hw_decode"] = false;
+            } else {
+                bool active = receiving && decoder_ && decoder_initialized_;
+                s["decode_backend"] = active ? decoder_->backend_name() : "none";
+                s["hw_decode"] = active && decoder_->is_hardware();
+            }
         }
         s["decode_fps"]       = decode_fps_.load();
         s["decode_saturated"] = decode_saturated_.load();
@@ -930,6 +924,11 @@ public:
         return "ok";
     }
 
+    // Redraw the splash after the address or the pending-network line changes.
+    void note_network_hint() {
+        if (!connected_.load()) splash_requested_ = true;
+    }
+
     void tick() {
         // Render splash asynchronously — set by disconnect_source/forget_source
         // so the IPC thread isn't blocked by the 4K software fill.
@@ -952,10 +951,13 @@ public:
             disconnect_source();
         }
 
+        if (engine_)
+            engine_->set_master_fallback(ch_num_, drm_ready());
         // Hotplug check
         if (drm_ && !drm_->is_initialized()) {
-            if (drm_->check_hotplug()) {
+            if (resolution_policy_.reinitialize([&] { return drm_->check_hotplug(); })) {
                 std::cout << "[Worker" << ch_num_ << "] Display connected via hotplug\n";
+                apply_saved_rotation();
                 drm_->show_splash(connected_.load());
                 // NDI receiver was already registered at start() — just connect
                 // to the configured source now that the display is ready.
@@ -983,7 +985,11 @@ public:
             if (recv_) {
                 int total = 0, dropped = 0;
                 recv_->get_performance(total, dropped);
-                double fps = (ms > 0) ? (total - fps_last_total_) * 1000.0 / ms : 0.0;
+                // Recreated receivers reset counters. Never expose negative FPS.
+                const int64_t delta=int64_t(total)-fps_last_total_;
+                double fps = (ms > 0 && delta>=0) ? delta * 1000.0 / ms : 0.0;
+                // FrameSync duplicates are display frames, not fresh source input.
+                if (delta>0) last_video_frame_ms_=now_ms();
                 fps_ = fps;
                 fps_last_total_ = total;
             }
@@ -1012,6 +1018,12 @@ public:
 
         // Health check — detect and recover from frozen subsystems
         health_check();
+
+        if (telemetry_ && recv_) {
+            int total = 0, dropped = 0;
+            recv_->get_performance(total, dropped);
+            telemetry_->emit(total, dropped, recv_->video_queue_depth());
+        }
     }
 
 private:
@@ -1043,10 +1055,10 @@ private:
 
         // 2. No video frames arriving despite being connected
         auto video_age = video_stale_ms();
-        if (video_age < 0 && connected_duration > 10000) {
+        if ((video_age < 0 && connected_duration > 10000) || video_age > 5000) {
             healthy = false;
             if (stall_count_ == 20)
-                std::cerr << "[Worker" << ch_num_ << "] HEALTH: no video frames received\n";
+                std::cerr << "[Worker" << ch_num_ << "] HEALTH: source video stopped\n";
         }
 
         // 3. Decoder hang: video arriving but no decoded output for 5s
@@ -1067,6 +1079,18 @@ private:
                 std::cerr << "[Worker" << ch_num_ << "] HEALTH: display freeze detected\n";
                 if (drm_) drm_->reset_flip_pending();
             }
+            // HW-1 H6: say what the display looked like, once the freeze is
+            // detected and again while it lasts, so a wedge leaves evidence.
+            if (drm_ && (stall_count_ == 6 || stall_count_ == 20 || stall_count_ == 60)) {
+                size_t queued;
+                {
+                    std::lock_guard<std::mutex> lk(frame_mtx_);
+                    queued = frame_queue_.size();
+                }
+                std::cerr << "[Worker" << ch_num_ << "] HEALTH: display state (stall "
+                          << stall_count_ << ", display_age=" << display_age
+                          << "ms, frame_queue=" << queued << "): " << drm_->stall_report() << "\n";
+            }
         }
 
         if (healthy) {
@@ -1079,64 +1103,63 @@ private:
     // Auto-resolution: match output mode to source resolution/framerate
     void try_match_source_mode(uint32_t src_w, uint32_t src_h,
                                 int frame_rate_n = 0, int frame_rate_d = 0) {
-        if (!auto_resolution_ || !drm_ || !drm_->is_initialized()) return;
-        // Only switch if source resolution actually changed
-        if (src_w == matched_src_w_ && src_h == matched_src_h_) return;
+        if (!drm_ || !drm_->is_initialized()) return;
+        const auto key = SourceModeKey::make(src_w, src_h, frame_rate_n, frame_rate_d);
+        resolution_policy_.match_source(key, [&] {
 
-        auto modes = drm_->list_modes();
-        if (modes.empty()) return;
+            auto modes = drm_->list_modes();
+            if (modes.empty()) return false;
 
-        // Compute source refresh rate
-        double src_hz = 0.0;
-        if (frame_rate_n > 0 && frame_rate_d > 0)
-            src_hz = (double)frame_rate_n / (double)frame_rate_d;
+            // Compute source refresh rate
+            double src_hz = 0.0;
+            if (frame_rate_n > 0 && frame_rate_d > 0)
+                src_hz = (double)frame_rate_n / (double)frame_rate_d;
 
-        // Find best matching mode:
-        // 1. Prefer exact resolution match
-        // 2. Among exact matches, prefer closest refresh rate
-        // 3. If no exact match, pick closest resolution (prefer >= source)
-        const DRMMode* best = nullptr;
-        double best_score = 1e9;
+            // Find best matching mode:
+            // 1. Prefer exact resolution match
+            // 2. Among exact matches, prefer closest refresh rate
+            // 3. If no exact match, pick closest resolution (prefer >= source)
+            const DRMMode* best = nullptr;
+            double best_score = 1e9;
 
-        for (const auto& m : modes) {
-            double score = 0.0;
-            // Resolution distance (prefer exact, then closest >=)
-            int dw = (int)m.width  - (int)src_w;
-            int dh = (int)m.height - (int)src_h;
-            if (dw == 0 && dh == 0) {
-                score = 0.0;  // exact resolution match
-            } else if (dw >= 0 && dh >= 0) {
-                score = 1000.0 + dw + dh;  // larger resolution, acceptable
-            } else {
-                score = 2000.0 + std::abs(dw) + std::abs(dh);  // smaller, less preferred
+            for (const auto& m : modes) {
+                double score = 0.0;
+                // Resolution distance (prefer exact, then closest >=)
+                int dw = (int)m.width  - (int)src_w;
+                int dh = (int)m.height - (int)src_h;
+                if (dw == 0 && dh == 0) {
+                    score = 0.0;  // exact resolution match
+                } else if (dw >= 0 && dh >= 0) {
+                    score = 1000.0 + dw + dh;  // larger resolution, acceptable
+                } else {
+                    score = 2000.0 + std::abs(dw) + std::abs(dh);  // smaller, less preferred
+                }
+                // Refresh rate closeness (weighted less than resolution)
+                if (src_hz > 0.0)
+                    score += std::abs(m.refresh_hz - src_hz) * 10.0;
+
+                if (score < best_score) {
+                    best_score = score;
+                    best = &m;
+                }
             }
-            // Refresh rate closeness (weighted less than resolution)
-            if (src_hz > 0.0)
-                score += std::abs(m.refresh_hz - src_hz) * 10.0;
 
-            if (score < best_score) {
-                best_score = score;
-                best = &m;
+            if (best) {
+                // Don't switch if we're already at this mode
+                if (best->width == drm_->width() && best->height == drm_->height() &&
+                    std::abs(best->refresh_hz - drm_->refresh_hz()) < 0.05 &&
+                    drm_->mode_active()) {
+                    return true;
+                }
+                std::cout << "[Worker" << ch_num_ << "] Auto-resolution: source "
+                          << src_w << "x" << src_h;
+                if (src_hz > 0) std::cout << "@" << src_hz;
+                std::cout << " → output " << best->width << "x" << best->height
+                          << "@" << best->refresh_hz << "\n";
+                return drm_->set_mode(best->width, best->height, best->refresh_hz) == ResolutionResult::Applied;
             }
-        }
-
-        if (best) {
-            // Don't switch if we're already at this mode
-            if (best->width == drm_->width() && best->height == drm_->height() &&
-                std::abs(best->refresh_hz - drm_->refresh_hz()) < 0.05) {
-                matched_src_w_ = src_w;
-                matched_src_h_ = src_h;
-                return;
-            }
-            std::cout << "[Worker" << ch_num_ << "] Auto-resolution: source "
-                      << src_w << "x" << src_h;
-            if (src_hz > 0) std::cout << "@" << src_hz;
-            std::cout << " → output " << best->width << "x" << best->height
-                      << "@" << best->refresh_hz << "\n";
-            drm_->set_mode(best->width, best->height, best->refresh_hz);
-            matched_src_w_ = src_w;
-            matched_src_h_ = src_h;
-        }
+            return false;
+        });
     }
 
     // Build the NDI receiver name: "DeviceAlias (OutputAlias)"
@@ -1149,7 +1172,6 @@ private:
 
     // -------------------------------------------------------------------------
     void on_video(NDIVideoFrame& vf) {
-        last_video_frame_ms_ = now_ms();
         bool is_compressed = (vf.stride == 0 && vf.size > 0);
         hx_stream_ = is_compressed;   // drives decode-saturation detection
 
@@ -1206,16 +1228,19 @@ private:
             // Uncompressed NDI (SpeedHQ/UYVY/NV12)
             if (!drm_ || !drm_->is_initialized() || !vf.data) return;
 
-            uint32_t drm_fmt = DRM_FORMAT_YUYV;
-            uint32_t fcc = (uint32_t)vf.fourcc;
-            if (fcc == NDI_LIB_FOURCC('B','G','R','X'))
-                drm_fmt = DRM_FORMAT_XRGB8888;
-            else if (fcc == NDI_LIB_FOURCC('B','G','R','A'))
-                drm_fmt = DRM_FORMAT_ARGB8888;
-            else if (fcc == NDI_LIB_FOURCC('U','Y','V','Y'))
-                drm_fmt = DRM_FORMAT_UYVY;
-            else if (fcc == NDI_LIB_FOURCC('N','V','1','2'))
-                drm_fmt = DRM_FORMAT_NV12;
+            uint32_t drm_fmt = 0;
+            switch (ndi_display_format(vf.fourcc)) {
+                case NDIDisplayFormat::BGRX: drm_fmt = DRM_FORMAT_XRGB8888; break;
+                case NDIDisplayFormat::BGRA: drm_fmt = DRM_FORMAT_ARGB8888; break;
+                case NDIDisplayFormat::UYVY: drm_fmt = DRM_FORMAT_UYVY; break;
+                case NDIDisplayFormat::NV12: drm_fmt = DRM_FORMAT_NV12; break;
+                default:
+                    if (warned_video_formats_.insert(static_cast<uint32_t>(vf.fourcc)).second)
+                        std::cerr << "[Worker" << ch_num_ << "] Unsupported NDI pixel format "
+                                  << static_cast<uint32_t>(vf.fourcc) << "\n";
+                    { std::lock_guard<std::mutex> lk(decoder_mutex_); codec_name_ = "unsupported"; }
+                    return;
+            }
 
             input_w_ = vf.width;
             input_h_ = vf.height;
@@ -1226,40 +1251,39 @@ private:
                 codec_name_ = "uncompressed";
             }
 
-            // Zero-copy: hold the SDK frame reference and free it from the
-            // display thread after rendering. Avoids copying ~4MB/frame at 1080p.
-            // Cross-thread free_video is explicitly supported by the NDI SDK.
-            RawFrame rf;
-            if (vf.ndi_frame) {
-                rf.ndi_frame = *vf.ndi_frame;  // copy struct (~100 bytes), not pixel data
-                rf.owns_ndi_frame = true;
-                vf.ndi_frame = nullptr;        // take ownership from recv_thread
-            } else {
-                // Fallback: copy data if no NDI frame to hold
-                rf.copied_data.assign(vf.data, vf.data + vf.size);
+            // Queue application-owned pixels so SDK receiver recreation cannot
+            // invalidate a frame still waiting for the display thread.
+            if (engine_ && has_audio_) {
+                std::lock_guard<std::mutex> lk(frame_mtx_);
+                if (!frame_queue_.accept_frame_timestamp(vf.timestamp, vf.framesync)) return;
             }
+            RawFrame rf;
+            rf.copied_data.assign(vf.data, vf.data + vf.size);
             rf.width = vf.width; rf.height = vf.height;
             rf.stride = vf.stride; rf.drm_format = drm_fmt;
             last_decoded_frame_ms_ = now_ms(); // uncompressed skips HW decoder
             {
                 std::lock_guard<std::mutex> lk(frame_mtx_);
-                // Drop oldest frame if display thread can't keep up
-                while (frame_queue_.size() >= 2) {
-                    auto& old = frame_queue_.front();
-                    if (old.owns_ndi_frame && recv_)
-                        recv_->free_video(&old.ndi_frame);
-                    frame_queue_.pop();
-                }
-                frame_queue_.push(std::move(rf));
+                frame_queue_.set_frame_bytes_hint(rf.size(),
+                    vf.frame_rate_n > 0 ? vf.frame_rate_n : 60,
+                    vf.frame_rate_d > 0 ? vf.frame_rate_d : 1);
+                rf.enqueued_us = DropTelemetry::mono_us();
+                if (!frame_queue_.push(std::move(rf),rf.enqueued_us) && telemetry_)
+                    telemetry_->on_queue_drop();
             }
             frame_cv_.notify_one();
         }
     }
 
     void on_audio(NDIAudioFrame& af) {
-        auto& cfg = Config::instance();
-        if (!audio_) return;
-        if (ch_num_ == 1 && cfg.decoder.ndi_audio == "NDIAudioDis") return;
+        if (engine_) {
+            if (!recv_ || !recv_->audio_enabled() || !af.data || af.channels<1 || af.channels>16) return;
+            ndimon::audio::Block block;block.channels=af.channels;block.frames=af.num_samples;
+            for(int c=0;c<af.channels;++c)block.plane[c]=reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(af.data)+size_t(c)*af.channel_stride);
+            engine_->push_ndi(ch_num_, block, af.sample_rate);
+            return;
+        }
+        if (!audio_ || !recv_ || !recv_->audio_enabled()) return;
         if (af.data) {
             // NDI audio is planar float: all channels in one contiguous buffer.
             // Channel c starts at base + c * channel_stride.
@@ -1273,8 +1297,13 @@ private:
     }
 
     void on_connection(bool connected, const std::string& src) {
+        hx_stream_ = false;
         connected_ = connected;
         if (connected) {
+            {
+                std::lock_guard<std::mutex> lk(decoder_mutex_);
+                codec_name_ = "none";
+            }
             connect_time_ms_ = now_ms();
             // Reset health timestamps so stale values don't trigger false alarms
             last_video_frame_ms_   = 0;
@@ -1299,7 +1328,7 @@ private:
             }
         }
 
-        // Push connection event to Node.js — it owns reconnect scheduling
+        // Push connection event to the control plane — it owns reconnect scheduling
         if (ipc_) {
             nlohmann::json ev;
             ev["type"]      = "connection";
@@ -1310,14 +1339,14 @@ private:
             ipc_->push_event(ev);
         }
 
-        // Update status file for ch1 (atomic write — Node.js may be reading)
+        // Update status file for ch1 (atomic write — ndimon-control may be reading)
         if (ch_num_ == 1) {
             try {
                 nlohmann::json status;
                 status["SourceName"] = connected ? src : "";
                 status["Status"]     = connected ? "active" : "inactive";
                 status["ChNum"]      = ch_num_;
-                const char* path = "/etc/ndimon-dec1-status.json";
+                const char* path = "/run/ndimon/ndimon-dec1-status.json";
                 const std::string tmp = std::string(path) + ".tmp";
                 {
                     std::ofstream f(tmp);
@@ -1333,12 +1362,15 @@ private:
         decoded_count_++;
         // Steal the frame so MPP/V4L2/FFmpeg drain does not release it when
         // this callback returns. Display thread renders then release_frame().
+        // decoder_mutex_ before frame_mtx_: reload_config's decode-mode
+        // branch uses the same order.
         DecodedFrame held = f;
         f.opaque = nullptr;
         f.fd = -1;
         f.data = nullptr;
         {
-            std::lock_guard<std::mutex> lk(frame_mtx_);
+            std::lock_guard<std::mutex> dk(decoder_mutex_);
+            std::lock_guard<std::mutex> fk(frame_mtx_);
             std::vector<DecodedFrame> dropped;
             while (hx_queue_.size() >= 2) {
                 dropped.push_back(std::move(hx_queue_.front()));
@@ -1356,30 +1388,26 @@ private:
     // Uncompressed frame queue — recv thread enqueues and returns immediately;
     // display_loop() drains the queue on a dedicated thread (avoids blocking
     // the NDI recv thread on vsync / software color conversion).
-    // Zero-copy: we hold the SDK frame reference and free it from the display
-    // thread after rendering (cross-thread free is SDK-supported).
+    // SDK storage is borrowed only during on_video; the queue owns its pixels.
     struct RawFrame {
-        // Zero-copy path: hold SDK frame, free after display
-        NDIlib_video_frame_v2_t ndi_frame{};
-        bool owns_ndi_frame = false;
-        // Fallback: copied data (only if zero-copy unavailable)
+        // Includes every source plane, including NV12 chroma.
         std::vector<uint8_t> copied_data;
 
         int width{}, height{}, stride{};
         uint32_t drm_format{};
+        int64_t enqueued_us{};  // diagnostics: DropTelemetry::mono_us() at enqueue
 
         const uint8_t* data() const {
-            return owns_ndi_frame ? ndi_frame.p_data : copied_data.data();
+            return copied_data.data();
         }
         size_t size() const {
-            return owns_ndi_frame
-                ? (size_t)ndi_frame.line_stride_in_bytes * ndi_frame.yres
-                : copied_data.size();
+            return copied_data.size();
         }
     };
+    std::set<uint32_t> warned_video_formats_;  // Known unsupported layouts; recv thread only.
     std::mutex              frame_mtx_;
     std::condition_variable frame_cv_;
-    std::queue<RawFrame>    frame_queue_;   // bounded to 2 frames (drop oldest)
+    DelayedFrameQueue<RawFrame> frame_queue_{3840ull * 2160 * 4};
     std::queue<DecodedFrame> hx_queue_;     // HX DMA/CPU frames for display thread
     std::atomic<bool>       display_running_{false};
     std::thread             display_thr_;
@@ -1412,8 +1440,10 @@ private:
             bool have_raw = false, have_hx = false;
             {
                 std::unique_lock<std::mutex> lk(frame_mtx_);
-                frame_cv_.wait_for(lk, std::chrono::milliseconds(50), [this] {
-                    return !frame_queue_.empty() || !hx_queue_.empty() || !display_running_;
+                auto wait_us = frame_queue_.empty() ? 50000LL :
+                    std::max<int64_t>(0,frame_queue_.next_due_us()-DropTelemetry::mono_us());
+                frame_cv_.wait_for(lk, std::chrono::microseconds(wait_us), [this] {
+                    return (!frame_queue_.empty() && frame_queue_.next_due_us() <= DropTelemetry::mono_us()) || !hx_queue_.empty() || !display_running_;
                 });
                 if (!display_running_) break;
                 if (!hx_queue_.empty()) {
@@ -1421,9 +1451,10 @@ private:
                     hx_queue_.pop();
                     have_hx = true;
                 } else if (!frame_queue_.empty()) {
-                    rf = std::move(frame_queue_.front());
-                    frame_queue_.pop();
-                    have_raw = true;
+                    if (auto frame = frame_queue_.pop_due(DropTelemetry::mono_us())) {
+                        rf = std::move(*frame);
+                        have_raw = true;
+                    }
                 }
             }
             if (have_hx) {
@@ -1432,25 +1463,32 @@ private:
                 if (decoder_) decoder_->release_frame(hx);
             } else if (have_raw) {
                 if (drm_ && drm_->is_initialized()) {
+                    const int64_t t0 = telemetry_ ? DropTelemetry::mono_us() : 0;
                     drm_->show_frame_memory(rf.data(), rf.size(),
                                             rf.width, rf.height, rf.stride, rf.drm_format);
                     last_display_commit_ms_ = now_ms();
+                    if (telemetry_)
+                        telemetry_->on_render(t0 - rf.enqueued_us, DropTelemetry::mono_us() - t0);
                 }
-                if (rf.owns_ndi_frame && recv_)
-                    recv_->free_video(&rf.ndi_frame);
             }
         }
-        std::lock_guard<std::mutex> lk(frame_mtx_);
-        while (!frame_queue_.empty()) {
-            auto& rf = frame_queue_.front();
-            if (rf.owns_ndi_frame && recv_)
-                recv_->free_video(&rf.ndi_frame);
-            frame_queue_.pop();
-        }
-        while (!hx_queue_.empty()) {
-            auto f = std::move(hx_queue_.front());
-            hx_queue_.pop();
-            if (decoder_) decoder_->release_frame(f);
+        drain_queued_frames();
+    }
+
+    void drain_queued_frames() {
+        std::queue<DecodedFrame> hx;
+        {
+            std::lock_guard<std::mutex> dk(decoder_mutex_);
+            {
+                std::lock_guard<std::mutex> fk(frame_mtx_);
+                frame_queue_.clear();
+                hx.swap(hx_queue_);
+            }
+            while (!hx.empty()) {
+                DecodedFrame f = std::move(hx.front());
+                hx.pop();
+                if (decoder_) decoder_->release_frame(f);
+            }
         }
     }
 
@@ -1458,20 +1496,21 @@ private:
     std::string connector_name_;
     std::string device_;
     std::string preferred_mode_;
-    bool        auto_resolution_ = false;
-    uint32_t    matched_src_w_ = 0;  // source resolution we last matched to
-    uint32_t    matched_src_h_ = 0;
+    AutoResolutionPolicy resolution_policy_;
     ScaleMode   scale_mode_;
     bool        has_audio_;
     int         ch_num_;
     int         lease_fd_  = -1;
     std::string source_name_;
     std::string source_ip_;
+    bool        remote_origin_ = false;   // source_name_ was set by the Discovery Server
     mutable std::mutex source_mutex_;
 
     std::unique_ptr<DRMDisplay>   drm_;
     std::unique_ptr<NDIReceiver>  recv_;
+    std::unique_ptr<DropTelemetry> telemetry_;  // only when NDIMON_TELEMETRY_CSV is set
     std::unique_ptr<AlsaAudio>    audio_;
+    ndimon::audio::AudioEngine* engine_ = nullptr;
 
     mutable std::mutex decoder_mutex_;
     std::unique_ptr<VideoDecoder> decoder_;
@@ -1502,8 +1541,6 @@ private:
     int                  stall_count_{0};
 
     IPCServer*        ipc_ = nullptr;
-    nlohmann::json    last_routing_event_;   // buffered for subscriber reconnect
-    mutable std::mutex routing_event_mutex_;
     std::string       last_source_;          // last successfully connected source name
 
     bool ndi_started_ = false;
@@ -1520,6 +1557,9 @@ std::atomic<bool> DisplayWorker::audio_in_use_{false};
 // main
 // ===========================================================================
 int main(int argc, char* argv[]) {
+    // Environment first, while the process is single-threaded: the SDK finds its
+    // config through NDI_CONFIG_DIR and must never see setenv() after this point.
+    pin_ndi_home();
     (void)argc; (void)argv;
 
     signal(SIGINT,  signal_handler);
@@ -1543,11 +1583,25 @@ int main(int argc, char* argv[]) {
     std::cout << "[NDIMon-R] Platform: " << PlatformDetect::name() << "\n";
 
     auto& cfg = Config::instance();
+    // Volatile cache only: preserve handed-over domains across the existing
+    // transport/engine service restart. A reboot still needs control-plane replay.
+    {
+        std::ifstream cached(ndisdk::config_dir() + "/decoder-config.json");
+        if (cached) {
+            try {
+                const auto restored = cfg.apply_config(nlohmann::json::parse(cached));
+                if (!restored.value("ok", false))
+                    std::cerr << "[Config] Cannot restore follower snapshot: " << restored.dump() << "\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[Config] Cannot restore follower snapshot: " << e.what() << "\n";
+            }
+        }
+    }
     cfg.load();
-    cfg.device.device_ip = get_primary_ip();
+    cfg.set_runtime_ip(get_primary_ip());
 
     // Set default NDI alias if not configured: "NDIMON-XXXX"
-    if (cfg.device.ndi_recv_name.empty()) {
+    if (cfg.device.ndi_recv_name.empty() && !cfg.follows("device")) {
         cfg.device.ndi_recv_name = "NDIMON-" + get_primary_mac_suffix();
         std::cout << "[NDIMon-R] NDI alias (default): " << cfg.device.ndi_recv_name << "\n";
         cfg.save_device();
@@ -1567,8 +1621,27 @@ int main(int argc, char* argv[]) {
         std::cout << "[NDIMon-R] Set hostname to: " << cfg.device.ndi_recv_name << "\n";
     }
 
-    pin_ndi_home();
-
+    // The selected interface may still be waiting for its DHCP lease at boot.
+    // Wait for it (the unit's start timeout is extended meanwhile) instead of
+    // failing and being restarted; only refuse when it never comes (NI-18, W3).
+    const auto selected_ndi_network = ndisdk::wait_for_selection(
+        [] { return ndisdk::network_selection(); },
+        std::chrono::seconds(60), std::chrono::milliseconds(250),
+        [](std::chrono::milliseconds waited) {
+            if (!g_running) return false;
+            if (waited.count() == 0)
+                std::cout << "[NDIMon-R] Waiting for the selected NDI network to get an address\n";
+#ifdef HAVE_SYSTEMD
+            if (waited.count() % 5000 == 0)
+                sd_notify(0, "EXTEND_TIMEOUT_USEC=15000000\nSTATUS=waiting for the selected NDI network");
+#endif
+            return true;
+        },
+        [](std::chrono::milliseconds interval) { std::this_thread::sleep_for(interval); });
+    if (!selected_ndi_network.ready()) {
+        std::cerr << "[NDIMon-R] Selected NDI network unavailable; refusing automatic fallback\n";
+        return 1;
+    }
     // Write ~/.ndi/ndi-config.v1.json BEFORE NDIlib_initialize() so the SDK
     // picks up the discovery server address and groups at startup (NDI 6.2+).
     write_ndi_sdk_config(cfg);
@@ -1580,10 +1653,10 @@ int main(int argc, char* argv[]) {
     }
 
     // The NDI SDK rewrites ndi-config.v1.json during NDIlib_initialize(), wiping any
-    // extra keys we wrote before init. Re-write now so the codec passthrough settings
-    // are present when the recv instances are created (SDK reads them at recv creation).
+    // settings written before init. Re-write discovery and transport preferences
+    // before creating receivers.
     write_ndi_sdk_config(cfg);
-    verify_passthrough_config();
+    std::cout << "[NDIMon-R] Standard NDI SDK receive (SDK-decoded frames)\n";
 
     // Auto-detect the DRM card that has HDMI/DP connectors.
     // On RPi4, HDMI outputs are on card1 (vc4), not card0 (V3D).
@@ -1646,6 +1719,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Create workers
+    // Workers borrow the engine; reverse destruction order also protects exception unwind.
+    std::unique_ptr<ndimon::audio::AudioEngine> audio_engine;
     std::vector<std::unique_ptr<DisplayWorker>> workers;
 
     // Open a DRM master fd and create per-connector leases so each worker
@@ -1669,6 +1744,54 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    DisplayWorker* audio_worker = nullptr;
+    std::map<int, DisplayWorker *> audio_workers;
+    int primary_audio_output = 1;
+    if (cfg.device.audio_engine == "v2") {
+        using namespace ndimon::audio;
+        audio_engine = std::make_unique<AudioEngine>(AudioEngine::Factories{
+            [&](const SourceSettings &s, int period) {
+                return std::make_unique<AlsaSource>(s.id, s.alsa_pcm, s.channels, period);
+            },
+            [&](const SinkSettings &s, bool master, int period) -> std::unique_ptr<AudioSink> {
+                auto pcm=s.alsa_pcm;
+                if (pcm == "auto") {
+                    int output = primary_audio_output;
+                    if (s.resource.size() == 6 && s.resource.rfind("hdmi:", 0) == 0 &&
+                        s.resource[5] >= '1' && s.resource[5] <= '8')
+                        output = s.resource[5] - '0';
+                    auto target = audio_workers.find(output);
+                    if (target == audio_workers.end())
+                        return std::make_unique<UnavailableSink>(s.id, s.channels, master,
+                                                                 "HDMI audio output unavailable: " +
+                                                                     std::to_string(output));
+                    pcm = s.resource.empty()
+                              ? AlsaAudio::find_hdmi_device(target->second->connector_name())
+                              : connector_pcm(target->second->connector_name());
+                    if (pcm.empty())
+                        return std::make_unique<UnavailableSink>(
+                            s.id, s.channels, master,
+                            "audio PCM mapping unavailable for connector " +
+                                target->second->connector_name());
+                }
+                return std::make_unique<AlsaSink>(s.id,pcm,s.channels,period,master);
+            },
+            [&](const SourceSettings &s, int) -> std::unique_ptr<AudioSource> {
+                int output = s.output ? s.output : primary_audio_output;
+                auto target = audio_workers.find(output);
+                if (target == audio_workers.end())
+                    return std::make_unique<UnavailableSource>(s.id, s.channels,
+                                                               "NDI audio output unavailable: " +
+                                                                   std::to_string(output));
+                auto *worker = target->second;
+                return std::make_unique<NdiAudioSource>(
+                    s.id, s.channels,
+                    [worker](int frames, int channels, float *const *planes,
+                             int *captured_channels) {
+                        return worker->pull_audio(frames, channels, planes, captured_channels);
+                    });
+            }});
+    }
     for (const auto& conn : connectors) {
         // Only HDMI-A-x, DP-x, eDP-x
         if (!is_output_conn(conn.name)) continue;
@@ -1690,6 +1813,12 @@ int main(int argc, char* argv[]) {
         auto w = std::make_unique<DisplayWorker>(
             conn.name, drm_device, out_cfg.preferred_mode,
             sm, primary_audio, ch, lfd);
+        if (!audio_worker) {
+            audio_worker = w.get();
+            primary_audio_output = ch;
+        }
+        audio_workers.emplace(ch, w.get());
+        w->set_audio_engine(audio_engine.get());
         w->start();
         workers.push_back(std::move(w));
     }
@@ -1701,8 +1830,36 @@ int main(int argc, char* argv[]) {
         auto w = std::make_unique<DisplayWorker>(
             "HDMI-A-1", drm_device, out_cfg.preferred_mode,
             ScaleMode::Letterbox, true, 1);
+        if (!audio_worker) {
+            audio_worker = w.get();
+            primary_audio_output = 1;
+        }
+        audio_workers.emplace(1, w.get());
+        w->set_audio_engine(audio_engine.get());
         w->start();
         workers.push_back(std::move(w));
+    }
+
+    if (audio_engine)
+        audio_engine->set_primary_output(primary_audio_output);
+    auto reload_audio = [&]() -> nlohmann::json {
+        int cap=5000;for(auto& w:workers)cap=std::min(cap,w->video_delay_cap_ms());
+        if(!audio_engine)return {{"ok",true},{"applied",nlohmann::json::array()},{"restarted",false},{"restart_required",true}};
+        auto result = cfg.follows("audio") ? audio_engine->apply(cfg.audio_settings(nullptr), cap)
+            : audio_engine->reload("/etc/ndimon-audio-settings.json", cap);
+        if (result.ok)
+            audio_engine->start();
+        for (auto &worker : workers)
+            worker->update_audio_capture();
+        auto effective=audio_engine->status();
+        if(audio_worker && effective.contains("settings"))audio_worker->set_video_delay(effective["settings"].value("video_delay_ms",0));
+        return result.to_json();
+    };
+    reload_audio();
+    ndimon::audio::AudioMasterLog audio_master_log;
+    if (audio_engine) {
+        audio_engine->start();
+        audio_master_log.update(audio_engine->status(), std::cout);
     }
 
     std::cout << "[NDIMon-R] " << workers.size() << " display worker(s) running\n";
@@ -1728,8 +1885,11 @@ int main(int argc, char* argv[]) {
     };
 
     ipc->set_command_callback([&](const IPCCommand& cmd) {
-        std::cout << "[NDIMon-R] IPC cmd: " << cmd.action
-                  << " output=" << cmd.output_index << "\n";
+        // The control plane re-asserts the settings with reload_config every 30 s;
+        // that one is logged below, and only when the reload changed something.
+        if (cmd.action != "reload_config")
+            std::cout << "[NDIMon-R] IPC cmd: " << cmd.action
+                      << " output=" << cmd.output_index << "\n";
 
         if (cmd.action == "connect") {
             auto* w = get_worker(cmd.output_index);
@@ -1748,8 +1908,13 @@ int main(int argc, char* argv[]) {
                 w->set_tally(cmd.tally_program, cmd.tally_preview);
 
         } else if (cmd.action == "reload_config") {
+            const std::string before = cfg.follower_snapshot().dump();
             cfg.load();
+            if (cfg.follower_snapshot().dump() != before)
+                std::cout << "[NDIMon-R] IPC cmd: reload_config output=" << cmd.output_index
+                          << " (configuration changed)\n";
             for (auto& w : workers) w->reload_config();
+            reload_audio();
 
         } else if (cmd.action == "set_scale_mode") {
             ScaleMode sm = ScaleMode::Letterbox;
@@ -1762,14 +1927,6 @@ int main(int argc, char* argv[]) {
             auto* w = get_worker(cmd.output_index);
             if (w) w->connect_source(cmd.source_name, cmd.source_ip);
 
-        } else if (cmd.action == "auto_resolution") {
-            auto* w = get_worker(cmd.output_index);
-            if (w) w->set_auto_resolution();
-
-        } else if (cmd.action == "set_rotation") {
-            auto* w = get_worker(cmd.output_index);
-            if (w) w->set_rotation(cmd.rotation_degrees);
-
         } else if (cmd.action == "show_splash") {
             cfg.load();  // pick up new splash config written by API
             // Only show splash on outputs that aren't actively streaming
@@ -1781,21 +1938,82 @@ int main(int argc, char* argv[]) {
     });
 
     ipc->set_query_callback([&](const IPCCommand& cmd) -> nlohmann::json {
+        if (cmd.action == "apply_config") {
+            const auto& domains = cmd.config_request.at("config");
+            const bool engine_restart = domains.contains("audio") &&
+                domains.at("audio").at("engine") != (audio_engine ? "v2" : "v1");
+            std::map<int, OutputConfig> previous;
+            for (auto& w : workers) previous.emplace(w->ch_num(), cfg.get_output(w->ch_num()));
+            auto response = cfg.apply_config(cmd.config_request, [&](const ndimon::audio::AudioSettings& settings) {
+                if (!audio_engine || engine_restart) return std::string{};
+                int cap = 5000;
+                for (auto& w : workers) cap = std::min(cap, w->video_delay_cap_ms());
+                const auto result = audio_engine->apply(settings, cap);
+                return result.ok ? std::string{} : result.error;
+            });
+            if (!response.value("ok", false)) return response;
+            if (!ndisdk::write_file_atomic(ndisdk::config_dir() + "/decoder-config.json", cfg.follower_snapshot().dump()))
+                std::cerr << "[Config] WARNING: cannot cache follower snapshot for service restart\n";
+            else chmod((ndisdk::config_dir() + "/decoder-config.json").c_str(), 0600);
+            if (engine_restart) response["restart_required"] = true;
+            write_ndi_sdk_config(cfg);
+            for (auto& w : workers) {
+                w->reload_config();
+                if (domains.contains("outputs")) {
+                    const auto out = cfg.get_output(w->ch_num());
+                    const auto& old = previous.at(w->ch_num());
+                    if (out.preferred_mode != old.preferred_mode || out.refresh_hz != old.refresh_hz) {
+                        if (out.preferred_mode.empty()) w->set_auto_resolution(0);
+                        else {
+                            unsigned width = 0, height = 0;
+                            if (sscanf(out.preferred_mode.c_str(), "%ux%u", &width, &height) == 2)
+                                w->set_resolution(width, height, out.refresh_hz, 0);
+                        }
+                    }
+                    if (out.source_name != old.source_name || out.source_ip != old.source_ip) {
+                        if (out.source_name.empty()) w->forget_source();
+                        else if (!w->on_remote_source(out.source_name, out.source_ip))
+                            w->connect_source(out.source_name, out.source_ip);
+                    }
+                }
+                if (!w->is_streaming()) w->show_splash(false);
+            }
+            if (audio_engine) audio_engine->start();
+            return response;
+        }
         if (cmd.action == "get_modes") {
             auto* w = get_worker(cmd.output_index);
             return w ? w->get_modes() : nlohmann::json{{"error", "no worker"}};
         }
-        if (cmd.action == "set_resolution") {
+        if (cmd.action == "set_rotation") {
+            auto* w=get_worker(cmd.output_index);
+            if (!w) return nlohmann::json{{"ok",false},{"error","no worker"}};
+            bool ok=w->set_rotation(cmd.rotation_degrees);
+            auto result=w->get_modes();
+            result["ok"]=ok;
+            if (!ok) result["error"]=w->rotation_busy()?"rotation_busy":"rotation_unsupported";
+            return result;
+        }
+        if (cmd.action == "set_resolution" || cmd.action == "auto_resolution") {
             auto* w = get_worker(cmd.output_index);
             if (!w) return nlohmann::json{{"ok", false}, {"error", "no worker"}};
             // Prefer fractional refresh_hz; fall back to integer refresh
             double hz = cmd.res_refresh_hz > 0.0
                         ? cmd.res_refresh_hz
                         : (double)cmd.res_refresh;
-            bool ok = w->set_resolution(cmd.res_width, cmd.res_height, hz);
+            auto result = cmd.action == "auto_resolution" ? w->set_auto_resolution(cmd.deadline_monotonic_ms)
+                : w->set_resolution(cmd.res_width, cmd.res_height, hz, cmd.deadline_monotonic_ms);
             nlohmann::json j = w->get_modes();
-            j["ok"] = ok;
+            j["ok"] = result == ResolutionResult::Applied;
+            if (result != ResolutionResult::Applied)
+                j["error"] = result == ResolutionResult::Busy ? "resolution_busy"
+                    : result == ResolutionResult::Expired ? "expired" : "resolution_failed";
             return j;
+        }
+        if (cmd.action == "reload_audio") return reload_audio();
+        if (cmd.action == "check_audio") {
+            int cap=5000;for(auto& w:workers)cap=std::min(cap,w->video_delay_cap_ms());
+            return nlohmann::json{{"ok",true},{"video_delay_cap_ms",cap}};
         }
         if (cmd.action == "get_status_all") {
             nlohmann::json j = nlohmann::json::array();
@@ -1806,8 +2024,8 @@ int main(int argc, char* argv[]) {
             static auto start_time = now_ms();
             nlohmann::json j;
             j["alive"] = true;
+            j["revision"] = cfg.applied_revision();
             j["uptime_s"] = (now_ms() - start_time) / 1000;
-            j["passthrough_ok"] = g_passthrough_ok.load();
             j["outputs"] = nlohmann::json::array();
             for (auto& w : workers) {
                 nlohmann::json h;
@@ -1830,14 +2048,23 @@ int main(int argc, char* argv[]) {
     ipc->set_status_provider([&]() -> nlohmann::json {
         // Return first worker's status + array of all
         nlohmann::json s;
+        s["revision"] = cfg.applied_revision();
         if (!workers.empty()) {
             s = workers[0]->get_status();
+            s["revision"] = cfg.applied_revision();
             s["platform"] = PlatformDetect::name();
         }
         nlohmann::json all = nlohmann::json::array();
         for (auto& w : workers) all.push_back(w->get_status());
         s["outputs"] = all;
-        s["passthrough_ok"] = g_passthrough_ok.load();
+        s["audio"] = audio_engine ? audio_engine->status() : nlohmann::json{{"running",false},{"engine","v1"}};
+        if(audio_engine){
+            int cap=5000,effective=5000;
+            for(auto& w:workers){cap=std::min(cap,w->video_delay_cap_ms());effective=std::min(effective,w->effective_video_delay_ms());}
+            s["audio"]["video_delay_cap_ms"]=cap;
+            s["audio"]["effective_video_delay_ms"]=effective;
+            s["audio"]["video_delay_capped"]=s["audio"].value("video_delay_ms",0)>effective;
+        }
         return s;
     });
 
@@ -1855,22 +2082,48 @@ int main(int argc, char* argv[]) {
     // Wire IPC pointer into workers so they can push events
     for (auto& w : workers) w->set_ipc(ipc.get());
 
-    // When a subscriber (Node.js) connects, replay buffered routing events
-    // so it can recover current state (handles startup race and Node.js restarts)
+    // When a subscriber (ndimon-control) connects, replay a Discovery Server
+    // route it may have missed (handles startup race and control restarts)
     ipc->set_subscriber_connected_callback([&]() {
         for (auto& w : workers) {
-            w->replay_routing_event();
-            w->push_connection_state();   // triggers Node.js retry loop if needed
+            w->replay_remote_source();
+            w->push_connection_state();   // triggers the supervisor's retry loop if needed
         }
     });
 
     // Main loop: tick workers (hotplug, fps)
-    // Config reload is now driven by explicit reload_config IPC commands from Node.js
+    // Config reload is now driven by explicit reload_config IPC commands from ndimon-control
     std::cout << "[NDIMon-R] Running. Ctrl+C to exit.\n";
 
+    std::string shown_ip = Config::instance().runtime_ip();
+    std::string shown_banner;
+    int hint_tick = 0;
     while (g_running) {
+        if (ndisdk::network_selection().signature() != selected_ndi_network.signature()) {
+            std::cerr << "[NDIMon-R] NDI interface/address changed; restarting SDK\n";
+            g_running = false;
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // The splash reads the address once per draw. Refresh it so a DHCP
+        // or restored address shows up without restarting the decoder.
+        if (++hint_tick >= 4) {
+            hint_tick = 0;
+            std::string ip = get_primary_ip();
+            std::string banner;
+            {
+                std::ifstream banner_file("/run/ndimon/net-pending");
+                if (banner_file) std::getline(banner_file, banner);
+            }
+            if (ip != shown_ip || banner != shown_banner) {
+                shown_ip = ip;
+                shown_banner = banner;
+                Config::instance().set_runtime_ip(ip);
+                for (auto& w : workers) w->note_network_hint();
+            }
+        }
         for (auto& w : workers) w->tick();
+        if (audio_engine) audio_master_log.update(audio_engine->status(), std::cout);
 #ifdef HAVE_SYSTEMD
         sd_notify(0, "WATCHDOG=1");
 #endif
@@ -1882,6 +2135,7 @@ int main(int argc, char* argv[]) {
 #endif
     std::cout << "[NDIMon-R] Shutting down...\n";
     ipc->stop();
+    if (audio_engine) audio_engine->stop();
     for (auto& w : workers) w->stop();
     workers.clear();
     if (drm_master_fd >= 0) close(drm_master_fd);

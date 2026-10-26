@@ -3,7 +3,11 @@
 #include <functional>
 #include <mutex>
 #include <unordered_map>
+#include <set>
 #include <nlohmann/json.hpp>
+#include "FollowerProtocol.h"
+#include "NdiSdkConfig.h"
+#include "audio/AudioSettings.h"
 
 struct DecoderConfig {
     int ch_num = 1;
@@ -15,12 +19,16 @@ struct DecoderConfig {
 };
 
 struct TransportConfig {
-    std::string rxpm = "TCP";  // TCP | UDP | Multicast | M-TCP | RUDP
+    std::string rxpm = "RUDP";  // RUDP (default) | Multicast | M-TCP | UDP | TCP
 };
 
 struct FinderConfig {
     std::string discovery_server_mode = "NDIDisServDis"; // NDIDisServEn | NDIDisServDis
     std::string discovery_server_ip = "";
+    // Register outputs with the Discovery Server, and let it route them.
+    // Legacy files had no switch: both were on.
+    bool receiver_advertising = true;
+    bool remote_control = true;
 };
 
 struct DeviceConfig {
@@ -30,6 +38,7 @@ struct DeviceConfig {
     std::string host_name = "";
     std::string device_ip = "";          // populated at runtime, not persisted
     std::string ndi_recv_name = "";      // NDI alias shown in discovery tools (empty = auto)
+    std::string audio_engine = "v1";
     std::string decode_mode = "auto";    // auto | hardware | software (HX decode path)
 };
 
@@ -45,6 +54,9 @@ struct OutputConfig {
     std::string source_ip;
     std::string output_alias;    // custom output label (empty = use connector name)
     uint32_t    rotation = 0;    // display rotation: 0, 90, 180, 270 degrees
+    double refresh_hz = 0;
+    std::string screensaver_mode = "BlackSS";
+    std::string source_selection = "NDI";
 };
 
 // Splash screen / screensaver appearance
@@ -68,8 +80,10 @@ struct SplashConfig {
     std::string text_live  = "Signal Available";
     float text_height_pct = 4.0f;   // font size as % of screen height [1–20]
 
+    // "gradient" (default) or "flat"; replaced the old show_box decoration
+    std::string backdrop = "gradient";
+
     // Element visibility toggles
-    bool show_box          = false;
     bool show_signal_text  = true;
     bool show_device_name  = true;
     bool show_device_url   = true;
@@ -87,14 +101,24 @@ public:
     static Config& instance();
 
     void load();
+    using AudioApply = std::function<std::string(const ndimon::audio::AudioSettings&)>;
+    nlohmann::json apply_config(const nlohmann::json& request, AudioApply apply_audio = {});
+    nlohmann::json applied_revision() const;
+    nlohmann::json follower_snapshot() const;
+    bool follows(const std::string& domain) const;
+    ndimon::audio::AudioSettings audio_settings(std::string* error) const;
 
     // Save only device-level settings (mode, video output, NDI alias).
-    // All other config files are owned by the Node.js API.
+    // All other config files are owned by ndimon-control.
     void save_device();
 
     // Per-output config (ch_num is 1-based: 1=HDMI-A-1, 2=HDMI-A-2, 3=DP-1)
     OutputConfig get_output(int ch_num) const;
     void set_output(int ch_num, const OutputConfig& out);
+
+    // Live address shown on the splash. Not written to disk.
+    void set_runtime_ip(const std::string& ip);
+    std::string runtime_ip() const;
 
     DecoderConfig   decoder;
     TransportConfig transport;
@@ -134,4 +158,8 @@ private:
     // Per-output cache uses the same mutex.
     mutable std::mutex mutex_;
     mutable std::unordered_map<int, OutputConfig> output_cache_;
+    std::set<std::string> followed_;
+    follower::Revision revision_;
+    ndimon::audio::AudioSettings audio_settings_;
+    nlohmann::json followed_config_ = nlohmann::json::object();
 };

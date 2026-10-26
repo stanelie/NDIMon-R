@@ -1,4 +1,6 @@
 #include "IPCServer.h"
+#include "ResolutionControl.h"
+#include "FollowerProtocol.h"
 #include <iostream>
 #include <cstring>
 #include <algorithm>
@@ -90,27 +92,16 @@ void IPCServer::server_thread() {
 }
 
 bool IPCServer::handle_client(int client_fd) {
-    // Read until newline (commands are newline-terminated JSON).
-    // Single read() can return a partial command if the kernel splits the
-    // write — keep pulling until \n or we hit the size cap.
-    static constexpr size_t kMaxCommand = 64 * 1024;
-    std::string buf;
-    buf.reserve(1024);
-    char chunk[2048];
-    while (buf.size() < kMaxCommand) {
-        struct pollfd pfd = { client_fd, POLLIN, 0 };
-        int pr = poll(&pfd, 1, 1000);
-        if (pr <= 0) break;
-        ssize_t n = read(client_fd, chunk, sizeof(chunk));
-        if (n <= 0) break;
-        buf.append(chunk, chunk + n);
-        if (buf.find('\n') != std::string::npos) break;
-    }
-    if (buf.empty()) return true;
-
     try {
-        auto j = nlohmann::json::parse(buf);
+        auto j = follower::read_line(client_fd);
         std::string action = j.value("action", "");
+        if (action == "apply_config") {
+            IPCCommand cmd;
+            cmd.action = action;
+            cmd.config_request = j;
+            follower::reply(client_fd, query_cb_ ? query_cb_(cmd) : follower::failure("apply_config unavailable"));
+            return true;
+        }
 
         // Subscriber mode: keep fd open and push events to it
         if (action == "subscribe") {
@@ -138,6 +129,12 @@ bool IPCServer::handle_client(int client_fd) {
         cmd.res_height      = j.value("height",     0u);
         cmd.res_refresh     = j.value("refresh",    0u);
         cmd.res_refresh_hz  = j.value("refresh_hz", 0.0);
+        cmd.deadline_monotonic_ms   = j.value("deadline_monotonic_ms", int64_t{0});
+        if ((action == "set_resolution" || action == "auto_resolution") && resolution_expired(cmd.deadline_monotonic_ms)) {
+            const char* expired = "{\"ok\":false,\"error\":\"expired\"}\n";
+            write(client_fd, expired, strlen(expired));
+            return true;
+        }
         cmd.output_index     = j.value("output",  0);
         if (cmd.output_index < 0 || cmd.output_index > 7)
             cmd.output_index = 0;
@@ -152,15 +149,15 @@ bool IPCServer::handle_client(int client_fd) {
             return true;
         }
 
-        if ((action == "get_status_all" || action == "get_modes" ||
-             action == "set_resolution" || action == "health") && query_cb_) {
+        if ((action == "get_status_all" || action == "reload_audio" || action == "check_audio" || action == "get_modes" ||
+             action == "set_resolution" || action == "auto_resolution" || action == "set_rotation" || action == "health") && query_cb_) {
             auto resp = query_cb_(cmd).dump() + "\n";
             write(client_fd, resp.c_str(), resp.size());
             return true;
         }
 
         // Fire-and-forget commands
-        // set_scale_mode, set_output_source, auto_resolution, connect, disconnect, set_tally, reload_config
+        // set_scale_mode, set_output_source, connect, disconnect, set_tally, reload_config
         if (cmd_cb_) {
             cmd_cb_(cmd);
         }
@@ -169,6 +166,7 @@ bool IPCServer::handle_client(int client_fd) {
         write(client_fd, ok, strlen(ok));
     } catch (const std::exception& e) {
         std::cerr << "[IPC] parse error: " << e.what() << "\n";
+        follower::reply(client_fd, follower::failure(e.what()));
     }
     return true;
 }

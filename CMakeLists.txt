@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
-project(NDIMon-R VERSION 1.1.1 LANGUAGES CXX C)
+project(NDIMon-R VERSION 1.4.0 LANGUAGES CXX C)
+
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "Installation prefix" FORCE)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,6 +39,7 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(LIBDRM REQUIRED libdrm)
 pkg_check_modules(ALSA   REQUIRED alsa)
+pkg_check_modules(SWRESAMPLE REQUIRED libswresample libavutil)
 
 # systemd notify (optional, for watchdog integration)
 pkg_check_modules(SYSTEMD libsystemd)
@@ -46,8 +51,9 @@ endif()
 # NEON software color conversion is used instead.
 
 # NDI SDK (manually specified)
-set(NDI_INCLUDE_DIR "/usr/local/include")
-set(NDI_LIB_DIR     "/usr/local/lib")
+set(NDI_INCLUDE_DIR "/usr/local/include" CACHE PATH "NDI SDK headers")
+set(NDI_LIB_DIR     "/usr/local/lib" CACHE PATH "NDI SDK libraries")
+set(CMAKE_SKIP_BUILD_RPATH TRUE)
 find_library(NDI_LIBRARY NAMES ndi PATHS ${NDI_LIB_DIR} REQUIRED)
 
 # Rockchip MPP (optional)
@@ -115,6 +121,18 @@ set(DECODER_SOURCES
     src/VideoDecoder.cpp
     src/PlatformDetect.cpp
     src/DRMDisplay.cpp
+    src/TextRender.cpp
+    src/SplashPaint.cpp
+    src/audio/AudioEngine.cpp
+    src/audio/AudioSettings.cpp
+    src/audio/DelayLine.cpp
+    src/audio/MixMatrix.cpp
+    src/audio/DriftCompensator.cpp
+    src/audio/AlsaPcm.cpp
+    src/audio/AlsaSink.cpp
+    src/audio/AlsaSource.cpp
+    src/audio/NdiAudioSource.cpp
+    src/audio/TimerMaster.cpp
     src/AlsaAudio.cpp
     src/IPCServer.cpp
 )
@@ -124,6 +142,7 @@ set(DECODER_INCLUDES
     ${NDI_INCLUDE_DIR}
     ${LIBDRM_INCLUDE_DIRS}
     ${ALSA_INCLUDE_DIRS}
+    ${SWRESAMPLE_INCLUDE_DIRS}
     /usr/include/libdrm
     src/
 )
@@ -131,6 +150,7 @@ set(DECODER_LIBS
     ${NDI_LIBRARY}
     ${LIBDRM_LIBRARIES}
     ${ALSA_LIBRARIES}
+    ${SWRESAMPLE_LIBRARIES}
     pthread dl atomic
     avahi-client avahi-common
 )
@@ -170,7 +190,7 @@ endif()
 message(STATUS "Color conversion: NEON software (RGA removed — mainline kernel incompatible)")
 
 # --- Decoder executable ---
-add_executable(ndimon-r ${DECODER_SOURCES})
+add_executable(ndimon-r ${DECODER_SOURCES} src/FollowerConfig.cpp)
 
 target_include_directories(ndimon-r PRIVATE ${DECODER_INCLUDES})
 target_link_libraries(ndimon-r PRIVATE ${DECODER_LIBS} nlohmann_json::nlohmann_json)
@@ -180,7 +200,7 @@ foreach(def ${DECODER_DEFINES})
 endforeach()
 
 # --- Finder executable ---
-add_executable(ndimon-finder finder/main.cpp)
+add_executable(ndimon-finder finder/main.cpp src/FollowerConfig.cpp src/audio/AudioSettings.cpp)
 
 target_include_directories(ndimon-finder PRIVATE
     ${NDI_INCLUDE_DIR}
@@ -200,10 +220,15 @@ endif()
 
 # --- Install ---
 install(TARGETS ndimon-r ndimon-finder
-    RUNTIME DESTINATION /usr/local/bin
+    RUNTIME DESTINATION bin
+)
+# Splash / OSD typeface (Inter, SIL OFL). The decoder falls back to its embedded
+# bitmap font when these are missing, so an old install still draws a splash.
+install(FILES fonts/Inter-Regular.ttf fonts/Inter-SemiBold.ttf fonts/LICENSE-Inter.txt
+    DESTINATION share/ndimon/fonts
 )
 # Config files are intentionally NOT installed by cmake.
-# install.sh handles first-time config installation with "skip if exists"
+# Native package lifecycle hooks fill missing defaults and preserve saved config.
 # semantics so user settings are never overwritten on update.
 
 message(STATUS "")

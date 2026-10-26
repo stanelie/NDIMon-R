@@ -1,5 +1,4 @@
 build/
-api/node_modules/
 *.o
 *.a
 *.d
@@ -11,6 +10,18 @@ Makefile
 .env
 .deploy-env
 *.log
-/tmp/
-# Vizrt NDI docs dump — local reference only, do not publish
-docs/ndi/vendor/
+__pycache__/
+
+# Locally assembled plugin archives and generated catalog entries
+dist/
+
+/control/target/
+
+# Declarative Debian directories are source, not compiler dependency files.
+!/packaging/debian/sysusers.d/
+!/packaging/debian/tmpfiles.d/
+
+/ui/node_modules/
+
+# Lockfile-pinned UI dist copied by cargo xtask build-vendor.
+/api/public/vendor/

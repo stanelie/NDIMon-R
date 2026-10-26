@@ -9,6 +9,7 @@
 
 struct IPCCommand {
     std::string action;
+    nlohmann::json config_request; // complete apply_config envelope
     std::string source_name;
     std::string source_ip;
     bool tally_program = false;
@@ -17,6 +18,7 @@ struct IPCCommand {
     uint32_t res_height     = 0;
     uint32_t res_refresh    = 0;
     double   res_refresh_hz = 0.0;
+    int64_t deadline_monotonic_ms = 0;     // host monotonic deadline for resolution commands
     int output_index     = 0;      // which display output (0-based)
     std::string scale_mode_str;    // for set_scale_mode action
     bool source_available = false; // for show_splash action
